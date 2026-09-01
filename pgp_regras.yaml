@@ -1,0 +1,78 @@
+BKP:
+  CMTS:
+    CISCO:
+      - 'show running-config'
+    CASA:
+      - 'show running-config'
+    ARRIS:
+      - 'show running-config verbose'
+  RTD:
+    CISCO:
+      - 'show running-config'
+      - 'show running-config interface bvi 2'
+      - 'show ipv4 access-lists  NET-FRONT-ASR90'
+      - 'show bgp ipv4 unicast summary | include 4230'
+      - 'show bgp'
+      - 'show running-config interface'
+    HUAWEI:
+      - 'display current-configuration'
+      - 'display acl name'
+      - 'display nat bandwidth'
+      - 'display nat statistics payload'
+      - 'display nat address-usage instance CGNAT-CUSTOMERS-NET address-group 1'
+      - 'display curre | in nat instance CGNAT'
+      - 'display bgp peer | include 4230'
+      - 'display bgp routing-table'
+      - 'display current-configuration interface'
+    ZTE:
+      - 'show running-config'
+      - 'show running-config ipv4-acl all | begin'
+      - 'show bgp ipv4 unicast summary | include 4230'
+      - 'show bgp ipv4 unicast neighbor out'
+      - 'show running-config-interface'
+    ALCATEL:
+      - 'environment more false'
+      - 'admin show configuration'
+  STW:
+    CISCO:
+      - 'show running-config'
+BKP_OLT:
+  OLT:
+    HUAWEI:
+      - 'display current-configuration'
+    ZTE:
+      - 'show running-config'
+    NOKIA:
+      - 'admin display-config'
+SEG:
+  CMTS:
+    CISCO:
+      - 'show running-config | include access-group|access-class'
+      - 'show running-config | include shared-secret'
+      - 'show running-config | include dynamic'
+      - 'show running-config | include privacy'
+      - 'show running-config | include tftp'
+      - 'show runn interface bundle 1.10 | include source'
+      - 'show runn | include information'
+    CASA:
+      - 'show version | include Running'
+      - 'show running-config | include access-group|access-class'
+      - 'show running-config | include shared'
+      - 'show running-config | include privacy'
+      - 'show running-config | include tftp-enforce'
+      - 'show interface ip-bundle | include interface|dhcp-authorization'
+    ARRIS:
+      - 'show running-config | include access-group'
+      - 'show running-config full verbose | include shared'
+      - 'show running-config full verbose | include dynamic-secret'
+      - 'show running-config full verbose | include tftp-enforce'
+      - 'show running-config full verbose | include mandatory'
+      - 'show running-config full verbose | include source-verify'
+VER:
+  CMTS:
+    CISCO:
+      - 'show version | include Cisco IOS Software'
+    CASA:
+      - 'show version | include Running'
+    ARRIS:
+      - 'show version'
