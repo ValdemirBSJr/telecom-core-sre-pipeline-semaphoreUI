@@ -195,6 +195,12 @@ class FornecedorArrisCMTS(FornecedorBase):
 class FornecedorCasaCMTS(FornecedorBase):
     def preparar_sessao(self) -> None:
         print("--- [INFO] Fornecedor Casa: Sessao pronta. ---")
+        # Sem esse aquecimento, o primeiro comando enviado apos o login nao retorna
+        # resposta nesse equipamento (observado com "show clock" isolado).
+        try:
+            self.conexao.send_command("page-off", cmd_verify=False, expect_string=r"#")
+        except Exception:
+            pass
 
     def obter_regex_prompt(self) -> str:
         return r"#"
@@ -241,6 +247,12 @@ FORNECEDORES: Dict[str, Type[FornecedorBase]] = {
     'alcatel_sros': FornecedorAlcatelRTD,
 }
 
+# Tarefas PGP (BKP/SEG/VER/BKP_OLT): mantem global_cmd_verify=False, como sempre foi
+# (ZTE teletype, buffer swapping do ASR9000 tratado a parte via cmd_verify=True local, etc).
+# Fora de uma tarefa PGP (consulta avulsa em qualquer equipamento), usa cmd_verify=True -
+# igual ao script legado de consulta simples, que nunca desligou a verificacao de eco.
+TAREFAS_PGP = {'BKP', 'SEG', 'VER', 'BKP_OLT'}
+
 
 def executar_automacao(args: argparse.Namespace) -> None:
     print(f"--- [INFO] Iniciando automacao para o host: {args.name} - {args.ip} ---")
@@ -270,7 +282,7 @@ def executar_automacao(args: argparse.Namespace) -> None:
             "timeout": 120,
             "auth_timeout": 120,
             "global_delay_factor": 5,
-            "global_cmd_verify": False,
+            "global_cmd_verify": not (args.tarefa and str(args.tarefa).upper() in TAREFAS_PGP),
         }
 
         dicionario_dispositivo = {k: v for k, v in dicionario_dispositivo.items() if k == 'session_log' or v is not None}
@@ -311,7 +323,7 @@ def executar_automacao(args: argparse.Namespace) -> None:
 
                 caminho_base = Path(args.caminho_base_logs)
                 arquivo_origem = Path(args.log_file)
-                pasta_destino = funcoes.garantir_pasta_destino(caminho_base, args.tarefa, args.cidade)
+                pasta_destino = funcoes.garantir_pasta_destino(caminho_base, args.tarefa, args.cidade, args.equipamento, args.modelo)
                 data_log = datetime.now().strftime('%d%m%Y')
 
                 arquivo_final = funcoes.padronizar_nome_e_mover(
@@ -370,7 +382,7 @@ def main() -> None:
     grupo_opcional.add_argument('-v', '--cidade', default='DESCONHECIDA', help="Cidade para separação de diretorios.")
     grupo_opcional.add_argument('-e', '--equipamento', help="Tipo do equipamento para a regra PGP (Ex: CMTS, RTD).")
     grupo_opcional.add_argument('-m', '--modelo', help="Fabricante para a regra PGP (Ex: CISCO, HUAWEI, CASA).")
-    grupo_opcional.add_argument('-d', '--caminho-base-logs', default='/etc/repositorio/local/scripts_cmts/', help="Caminho base de backups.")
+    grupo_opcional.add_argument('-d', '--caminho-base-logs', default='/etc/repositorio/local/scripts/', help="Caminho base de backups.")
     grupo_opcional.add_argument('-x', '--ignorar', help="Comandos a ignorar na validação PGP.")
 
     args = parser.parse_args()
