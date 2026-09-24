@@ -1,0 +1,304 @@
+# PROD
+---
+# ==============================================================================
+# PLAY 1: EXECUÇÃO NOS EQUIPAMENTOS E VALIDAÇÃO PGP
+# ==============================================================================
+
+# Início
+- name: Consultar informações e Validar PGP em CMTS
+  hosts: all
+  connection: local
+  gather_facts: no
+
+  vars:
+    # Captura em Cascata: Tenta OS Env -> Tenta Extra Var -> Assume Default
+    ACAO: "{{ lookup('env', 'ACAO') | default('show', true) }}"
+    TAREFA: "{{ lookup('env', 'TAREFA') }}"
+    VENDOR: "{{ lookup('env', 'VENDOR') }}"
+    MODELO: "{{ lookup('env', 'MODELO') }}"
+    COMANDOS: "{{ lookup('env', 'COMANDOS') }}"
+    CIDADE: "{{ lookup('env', 'CIDADE') }}"
+    WEBHOOK_CIDADE: "{{ lookup('env', 'WEBHOOK_CIDADE') }}"
+    URL: "{{ lookup('env', 'URL') }}"
+    HC: "{{ lookup('env', 'HC') | trim }}"
+
+    PYTHON_SCRIPT_RESUMO: "/etc/repositorio/local/Envia_resumo.py"
+
+    # diretório base apontado para a Memória RAM (/dev/shm)
+    CIDADE_FORMATADA: "{{ CIDADE | default('DESCONHECIDA') | upper | replace(' ', '_') }}"
+    BASE_DIR: "/dev/shm/pgp_staging_{{ CIDADE_FORMATADA }}_{{ run_id }}"
+
+  # --- TELEMETRIA DE BORDA: INÍCIO DO JOB PING HC ---
+  pre_tasks:
+    - name: Sinalizar INICIO do Healthcheck
+      ansible.builtin.command: "/usr/local/bin/hc-wrapper {{ HC }} start"
+      delegate_to: localhost
+      run_once: true
+      when: HC is defined and HC | length > 0
+      changed_when: false
+
+    # ID unico desta execucao do playbook (igual para todos os hosts). Isola o staging em RAM
+    # e o log raw: dois jobs simultaneos (mesmo host ou mesma cidade) nao leem, escrevem
+    # nem apagam os arquivos temporarios um do outro.
+    - name: Gerar ID unico da execucao
+      ansible.builtin.set_fact:
+        run_id: "{{ lookup('ansible.builtin.pipe', 'cat /proc/sys/kernel/random/uuid') }}"
+      run_once: true
+
+    - name: Gerar caminho unico do log raw
+      ansible.builtin.set_fact:
+        raw_log_path: "/tmp/{{ inventory_hostname }}_{{ run_id }}_raw.log"
+
+  tasks:
+
+    # --- BLOC: TAREFAS CRÍTICAS (Monitoradas) ---
+    - block:
+        - name: Executar script de consulta e validação PGP nos equipamentos
+          ansible.builtin.command: >
+            python3 cli.py
+            -a {{ ACAO }}
+            -i {{ ansible_host }}
+            -n {{ inventory_hostname }}
+            -t {{ tipo }}
+            -c "{{ COMANDOS }}"
+            {% if ACAO == 'show' and TAREFA is defined and TAREFA in ['BKP', 'SEG', 'VER', 'BKP_OLT'] %}
+            -q "{{ TAREFA }}"
+            --log-file "{{ raw_log_path }}"
+            -d "{{ BASE_DIR }}"
+            {% if comandos_ignorados is defined and comandos_ignorados | length > 0 %}-x "{{ comandos_ignorados }}"{% endif %}
+            {% endif %}
+            {% if VENDOR is defined and VENDOR | length > 0 %}-e "{{ VENDOR }}"{% endif %}
+            {% if MODELO is defined and MODELO | length > 0 %}-m "{{ MODELO }}"{% endif %}
+            {% if CIDADE is defined and CIDADE | length > 0 %}-v "{{ CIDADE }}"{% endif %}
+          args:
+            # cli.py fica na raiz do repositorio, nao na pasta playbooks/
+            chdir: /etc/repositorio/local
+          environment:
+            USUARIO: "{{ lookup('env', 'USUARIO') }}"
+            SENHA: "{{ lookup('env', 'SENHA') }}"
+          register: script_output
+          failed_when: script_output.rc != 0
+
+        # Consulta simples (sem TAREFA de PGP): nao gera arquivo no NFS, entao o log
+        # do Semaphore e a unica forma de ver o resultado - precisa exibir o output.
+        - name: Exibir a saida do script (Consulta Simples)
+          ansible.builtin.debug:
+            msg: "{{ script_output.stdout.splitlines() }}"
+          when: not (ACAO == 'show' and TAREFA is defined and TAREFA in ['BKP', 'SEG', 'VER', 'BKP_OLT'])
+
+        # Tarefa PGP (BKP/SEG/VER/BKP_OLT): o resultado ja fica registrado no arquivo
+        # movido para o NFS, entao oculta o stdout aqui para evitar vazar senhas/
+        # shared-secrets via running-config no log do Semaphore.
+        - name: Exibir a saida do script (Oculto no log em tarefas PGP)
+          ansible.builtin.debug:
+            msg: "Script executado com sucesso e logs validados."
+          when: ACAO == 'show' and TAREFA is defined and TAREFA in ['BKP', 'SEG', 'VER', 'BKP_OLT']
+
+        - name: Registrar SUCESSO para o Resumo
+          ansible.builtin.set_fact:
+            resultado_host:
+              hostname: "{{ inventory_hostname }}"
+              status: "OK"
+              falha: null
+
+      # --- RESCUE: TRATAMENTO E CLASSIFICAÇÃO DE FALHA ---
+      rescue:
+        - name: Categorizar o tipo de Erro (PGP vs Infraestrutura)
+          vars:
+            stderr_texto: "{{ script_output.stderr | default('Erro Desconhecido ou Timeout') }}"
+            is_pgp_error: "{{ 'PGP NÃO ADERENTE' in stderr_texto }}"
+
+            busca_regex: "{{ stderr_texto | regex_search('Comandos faltantes: (.*)', '\\1') }}"
+
+            # Limpeza via Regex para enviar ao Teams
+            msg_pgp: "{{ busca_regex[0] if (busca_regex is not none and busca_regex | length > 0) else 'Faltam comandos' }}"
+            msg_infra: "{{ stderr_texto | regex_replace('^!!! \\[.*?\\] (em .*?: )?', '') | truncate(80, True, '...') }}"
+          ansible.builtin.set_fact:
+            resultado_host:
+              hostname: "{{ inventory_hostname }}"
+              status: "{% if is_pgp_error %}NOK{% else %}FALHA{% endif %}"
+              falha: "{% if is_pgp_error %}{{ msg_pgp }}{% else %}{{ msg_infra }}{% endif %}"
+
+
+      # Garante a limpeza do buffer de RAM / Disco mesmo em caso de falha fatal no Python
+      always:
+        - name: Limpar log raw temporario
+          ansible.builtin.file:
+            path: "{{ raw_log_path }}"
+            state: absent
+          changed_when: false
+
+    # --- AGREGAÇÃO FINAL (Fora do Block/Rescue para capturar todos) ---
+    - block:
+        - name: Agrupar resultados de TODOS os hosts (Sucessos e Falhas)
+          ansible.builtin.set_fact:
+            lista_resumo_geral: "{{ ansible_play_hosts_all | map('extract', hostvars, 'resultado_host') | select('defined') | list }}"
+          run_once: true
+
+        - name: Enviar Card de Resumo para a Cidade
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: true   # <--- CRÍTICO: Protege a esteira contra quedas do Teams
+          vars:
+            MES_ATUAL: "{{ now(utc=False, fmt='%B') | upper }}"
+            ANO_ATUAL: "{{ now(utc=False, fmt='%Y') }}"
+            DATA_ATUAL: "{{ now(utc=False, fmt='%d.%m.%Y') }}"
+            URL_DINAMICA: "{{ URL }}/LOG_{{ TAREFA }}/{{ MES_ATUAL }}-{{ ANO_ATUAL }}/{{ DATA_ATUAL }}/"
+          ansible.builtin.shell: >
+            python3 {{ PYTHON_SCRIPT_RESUMO }}
+            -w {{ WEBHOOK_CIDADE | quote }}
+            -t "PGP - {{ CIDADE | default('Datacenter') }}"
+            -u {{ URL_DINAMICA | quote }}
+            -d {{ lista_resumo_geral | to_json | quote }}
+          when:
+            - lista_resumo_geral | default([]) | length > 0
+            - WEBHOOK_CIDADE is defined
+            - WEBHOOK_CIDADE | length > 0
+            - ACAO == 'show'
+            - TAREFA is defined
+            - TAREFA in ['BKP', 'SEG', 'VER', 'BKP_OLT']
+
+        # --- TELEMETRIA DE BORDA: FALHA LOGICA ---
+        - name: Sinalizar FALHA ao Healthcheck (Ofensores PGP/Rede)
+          ansible.builtin.command: "/usr/local/bin/hc-wrapper {{ HC }} 1"
+          delegate_to: localhost
+          run_once: true
+          when:
+            - HC is defined and HC | length > 0
+            - "lista_resumo_geral | selectattr('status', '!=', 'OK') | list | length > 0"
+          changed_when: false
+
+
+# ==============================================================================
+# PLAY 2: CÓPIA PARA O NFS DE BACKUP E VEREDITO FINAL
+# ==============================================================================
+- name: Enviar logs para o servidor de Backup (via NFS)
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    ACAO: "{{ lookup('env', 'ACAO') | default('show', true) }}"
+    TAREFA: "{{ lookup('env', 'TAREFA') | default('', true) | upper }}"
+    CIDADE: "{{ lookup('env', 'CIDADE') | default('DESCONHECIDA', true) }}"
+    WEBHOOK_CIDADE: "{{ lookup('env', 'WEBHOOK_CIDADE') }}"
+    WEBHOOK_FALHA: "{{ lookup('env', 'WEBHOOK_FALHA') }}"
+    HC: "{{ lookup('env', 'HC') | trim }}"
+    CIDADE_FORMATADA: "{{ CIDADE | upper | replace(' ', '_') }}"
+    # run_id foi definido na Play 1 (set_fact run_once); aqui so precisa ser lido de qualquer host.
+    RUN_ID: "{{ groups['all'] | map('extract', hostvars, 'run_id') | select('defined') | first | default('') }}"
+    BASE_DIR: "/dev/shm/pgp_staging_{{ CIDADE_FORMATADA }}_{{ RUN_ID }}"
+
+    NFS_MOUNT_POINT: "/mnt/ServidorBackup"
+    # Sem sufixo de pasta: funcoes.py ja grava <CODIGO_CIDADE>/<TIPO>/<CATEGORIA>/<AAAA>/<MES>/<DD>
+    # dentro do BASE_DIR, espelhando a mesma raiz usada por migrar_pgp_logs_legado.sh.
+    NFS_DEST_DIR: "/mnt/ServidorBackup"
+
+    # Script de Falha Grave
+    PYTHON_SCRIPT_FALHA: "/etc/repositorio/local/Envia_card.py"
+
+  tasks:
+    # 1. Verifica a existência do diretório gerado na RAM de forma plana e segura
+    - name: Verificar se o diretorio base existe localmente
+      ansible.builtin.stat:
+        path: "{{ BASE_DIR }}"
+      register: status_diretorio
+
+    # 2. Verifica se o mount NFS está de fato disponível antes de copiar
+    - name: Verificar se o ponto de montagem NFS está ativo
+      ansible.builtin.command: mountpoint -q {{ NFS_MOUNT_POINT }}
+      register: status_nfs
+      changed_when: false
+      failed_when: false
+
+    # 3. Bloco de cópia encapsulado. Sem 'meta: end_play', o Ansible pula a cópia mas não aborta o arquivo.
+    - block:
+        - name: Falhar cedo caso o NFS não esteja montado
+          ansible.builtin.fail:
+            msg: "Ponto de montagem NFS {{ NFS_MOUNT_POINT }} não está ativo."
+          when: status_nfs.rc != 0
+
+        - name: Garantir que a raiz exista no destino NFS
+          ansible.builtin.file:
+            path: "{{ NFS_DEST_DIR }}"
+            state: directory
+          changed_when: false
+
+        - name: Copiar arvore da RAM para o destino NFS
+          ansible.posix.synchronize:
+            src: "{{ BASE_DIR }}/"
+            dest: "{{ NFS_DEST_DIR }}/"
+            archive: yes
+          register: rsync_result
+          retries: 3
+          delay: 5
+          until: rsync_result is not failed
+
+        # --- TELEMETRIA DE BORDA: SUCESSO TOTAL ---
+        - name: Sinalizar SUCESSO TOTAL ao Healthcheck
+          ansible.builtin.command: "/usr/local/bin/hc-wrapper {{ HC }} 0"
+          when: HC is defined and HC | length > 0
+          changed_when: false
+
+      rescue:
+        - name: Disparar Alerta de Falha de Infraestrutura (NFS/BKP)
+          ansible.builtin.shell: >
+            python3 {{ PYTHON_SCRIPT_FALHA }}
+            -w {{ WEBHOOK_FALHA | quote }}
+            -t "🚨 FALHA GRAVE: INFRAESTRUTURA DE BACKUP"
+            -n "Semaforo -> BKP NFS ({{ NFS_MOUNT_POINT }})"
+            -m "A cópia para o NFS falhou ao transferir os arquivos PGP para o destino. Verifique os logs no Semaphore UI e o mount NFS."
+          when:
+            - WEBHOOK_FALHA is defined
+            - WEBHOOK_FALHA | length > 0
+          ignore_errors: true
+
+        # --- TELEMETRIA DE BORDA: FALHA FÍSICA ---
+        - name: Sinalizar FALHA ao Healthcheck (NFS Quebrado)
+          ansible.builtin.command: "/usr/local/bin/hc-wrapper {{ HC }} 1"
+          when: HC is defined and HC | length > 0
+          changed_when: false
+
+        - name: Forçar Falha CI/CD (NFS Quebrado)
+          ansible.builtin.fail:
+            msg: "Falha de comunicação com o destino de Backup NFS {{ NFS_MOUNT_POINT }}."
+
+      always:
+        - name: Limpar a memoria RAM local (Garantia de não lotar o /dev/shm)
+          ansible.builtin.file:
+            path: "{{ BASE_DIR }}"
+            state: absent
+          changed_when: false
+
+        # Varre staging orfao deixado por execucoes interrompidas (job cancelado/morto entre
+        # a Play 1 e a Play 2). O corte de 6h fica bem acima da duracao de qualquer job, entao
+        # nao encosta no staging de execucoes em andamento. Nunca derruba o job.
+        - name: Localizar staging orfao em /dev/shm
+          ansible.builtin.find:
+            paths: /dev/shm
+            patterns: "pgp_staging_*"
+            file_type: directory
+            age: 6h
+          register: staging_orfao
+          ignore_errors: true
+
+        - name: Remover staging orfao
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ staging_orfao.files | default([]) }}"
+          loop_control:
+            label: "{{ item.path }}"
+          ignore_errors: true
+
+      # A cópia só ocorre se a tarefa for válida E a pasta tiver sido de fato criada
+      when:
+        - ACAO == 'show'
+        - TAREFA in ['BKP', 'SEG', 'VER', 'BKP_OLT']
+        - status_diretorio.stat.exists
+
+    # 4. VEREDITO FINAL (Roda sempre, independente da cópia ter rodado ou sido pulada)
+    - name: Falhar CI/CD caso haja equipamentos ofensores ou inativos no Play 1
+      ansible.builtin.fail:
+        msg: "Existem equipamentos NOK ou com FALHA no relatório PGP."
+      when: "groups['all'] | map('extract', hostvars, 'resultado_host') | select('defined') | selectattr('status', '!=', 'OK') | list | length > 0"
