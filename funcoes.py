@@ -12,11 +12,26 @@ from typing import List, Tuple, Dict, Any, Optional
 
 EQUIPAMENTOS_PREFIXO_MODELO: List[str] = ['CMTS', 'OLT']
 
-MAPEAMENTO_PASTAS_GITEA = {
-    'BKP': 'BKP_SH/LOG_BKP',
-    'SEG': 'PGP_CMTS_SEGURANCA/SEGURANCA_LOG',
-    'VER': 'PGP_CMTS_VERSION/VERSION_LOG',
-    'BKP_OLT': 'BKP_OLT/LOG_BKP',
+# Estrutura de destino no NFS (/mnt/ServidorBackup): <CIDADE>/<TIPO>/<CATEGORIA>/<AAAA>/<MES>/<DD>/
+# Espelha a organização já aplicada aos logs legados por migrar_pgp_logs_legado.sh.
+CATEGORIA_POR_TAREFA = {
+    'BKP': 'BKP',
+    'SEG': 'SEG',
+    'VER': 'VER',
+    'BKP_OLT': 'BKP',
+}
+
+# Mesma abreviação usada em migrar_pgp_logs_legado.sh (CITY_MAP) - manter sincronizado.
+CIDADE_PARA_CODIGO = {
+    'ARACAJU': 'AJU',
+    'RECIFE': 'RCE',
+    'FORTALEZA': 'FLA',
+    'MACEIO': 'MCO',
+    'JOAO_PESSOA': 'JPA',
+    'NATAL': 'NTL',
+    'SALVADOR': 'SDR',
+    'TERESINA': 'TSA',
+    'VIT_CONQUISTA': 'VIT',
 }
 
 def carregar_regras_pgp() -> Dict[str, Any]:
@@ -33,21 +48,34 @@ def carregar_regras_pgp() -> Dict[str, Any]:
 # 2. MANIPULAÇÃO DE DIRETÓRIOS E ARQUIVOS (REGRA DE TAREFA APLICADA)
 # ==============================================================================
 
-def garantir_pasta_destino(caminho_base: Path, tipo_tarefa: str, cidade: str) -> Path:
+def garantir_pasta_destino(caminho_base: Path, tipo_tarefa: str, cidade: str, equipamento: str, modelo: str) -> Path:
     agora = datetime.now()
     mes_atual = agora.strftime('%B').upper()
     ano_atual = agora.strftime('%Y')
-    data_atual = agora.strftime('%d.%m.%Y')
+    dia_atual = agora.strftime('%d')
 
     tarefa_sanitizada = str(tipo_tarefa).upper().strip()
-    if tarefa_sanitizada not in MAPEAMENTO_PASTAS_GITEA:
+    if tarefa_sanitizada not in CATEGORIA_POR_TAREFA:
         # [SÊNIOR] Nunca use sys.exit() em bibliotecas. Use Raise para o caller tratar o erro.
         raise ValueError(f"Tarefa inválida para nomenclatura de diretório: {tarefa_sanitizada}")
 
-    cidade_sanitizada = str(cidade).upper().strip().replace(" ", "_")
-    subpasta_gitea = MAPEAMENTO_PASTAS_GITEA[tarefa_sanitizada]
+    categoria = CATEGORIA_POR_TAREFA[tarefa_sanitizada]
 
-    pasta_destino = caminho_base / cidade_sanitizada / subpasta_gitea / f"{mes_atual}-{ano_atual}" / data_atual
+    if tarefa_sanitizada == 'BKP_OLT':
+        tipo_equipamento = 'OLT'
+    elif tarefa_sanitizada in ('SEG', 'VER'):
+        tipo_equipamento = 'CMTS'
+    else:
+        # BKP: separa CMTS de ROTEADOR. Equipamento/modelo podem chegar trocados (mesma
+        # tolerancia que ja existe em validar_pgp), entao checa os dois campos.
+        # Equipamentos legados (STW) nao sao mais consultados; qualquer excecao cai em CMTS.
+        candidatos = {str(equipamento).upper().strip(), str(modelo).upper().strip()}
+        tipo_equipamento = 'ROTEADOR' if 'RTD' in candidatos else 'CMTS'
+
+    cidade_sanitizada = str(cidade).upper().strip().replace(" ", "_")
+    codigo_cidade = CIDADE_PARA_CODIGO.get(cidade_sanitizada, cidade_sanitizada)
+
+    pasta_destino = caminho_base / codigo_cidade / tipo_equipamento / categoria / ano_atual / mes_atual / dia_atual
 
     try:
         pasta_destino.mkdir(parents=True, exist_ok=True)
